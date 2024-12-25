@@ -10,12 +10,18 @@
 #include <stdbool.h>
 #include <fcntl.h> // For fcntl
 #include <errno.h>
+#include <sys/epoll.h>
 
 #define PORT 8080  // Port to listen on
 #define BACKLOG 10 // Max number of pending connections
 #define BUFFER_SIZE 1024
-#define THREAD_POOL_SIZE 4      // Number of threads in the pool
-#define TASK_QUEUE_SIZE 10      // Maximum number of tasks in the queue
+#define THREAD_POOL_SIZE 2  // Number of threads in the pool
+#define TASK_QUEUE_SIZE 10  // Maximum number of tasks in the queue
+#define EPOLL_MAX_EVENTS 10 // Max events to handle at once
+
+int epoll_fd; // epoll instance descriptor
+struct epoll_event ev;
+struct epoll_event events[EPOLL_MAX_EVENTS];
 
 volatile bool server_running = true; // Flag to control server operation
 
@@ -45,12 +51,12 @@ void handle_not_found(int client_socket);
 void handle_client_request(int client_socket);
 void shutdown_handler(int signum);
 void set_socket_nonblocking(int socket);
-void* worker_thread(void *arg);
+void *worker_thread(void *arg);
 void add_task_to_pool(thread_pool_t *pool, int client_socket);
 void thread_pool_shutdown(thread_pool_t *pool);
 thread_pool_t *thread_pool_init(int pool_size, int queue_size);
 
-void* worker_thread(void *arg)
+void *worker_thread(void *arg)
 {
     thread_pool_t *pool = (thread_pool_t *)arg;
 
@@ -214,7 +220,6 @@ void handle_client_request(int client_socket)
     {
         printf("Failed to receive request.\n");
         close(client_socket);
-        // return NULL;
     }
 
     // Null-terminate the string
@@ -368,27 +373,67 @@ void start_server()
     // Set server socket to non-blocking mode
     set_socket_nonblocking(server_socket);
 
-    // Main server loop to accept incoming connections
+    // Create an epoll instance
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1)
+    {
+        printf("epoll_create1");
+        exit(EXIT_FAILURE);
+    }
+
+    // Add the server socket to the epoll instance
+    ev.events = EPOLLIN; // Monitor for input events (new connections)
+    ev.data.fd = server_socket;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_socket, &ev) == -1)
+    {
+        printf("epoll_ctl: server_socket");
+        exit(EXIT_FAILURE);
+    }
+
     while (server_running)
     {
-        // Accept a new connection
-        int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
-
-        // If no client is available, accept will return -1 with errno set to EAGAIN or EWOULDBLOCK.
-        if (client_socket < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        // Wait for events on the epoll instance
+        int nfds = epoll_wait(epoll_fd, events, EPOLL_MAX_EVENTS, -1); // Blocking call
+        if (nfds == -1)
         {
-            // No new client connection, check the shutdown flag again.
-            continue;
+            printf("epoll_wait");
+            break;
         }
 
-        if (client_socket < 0)
+        // Process the events
+        for (int i = 0; i < nfds; i++)
         {
-            printf("Accept failed.\n");
-            continue; // Move to the next connection
-        }
-        else
-        {
-            add_task_to_pool(pool, client_socket);
+            if (events[i].data.fd == server_socket)
+            {
+                // New connection on the server socket
+                int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
+                if (client_socket == -1)
+                {
+                    printf("accept failed");
+                    continue;
+                }
+
+                // Set client socket to non-blocking mode
+                set_socket_nonblocking(client_socket);
+
+                // Add the new client socket to the epoll instance
+                ev.events = EPOLLIN | EPOLLET; // Edge-triggered read event
+                ev.data.fd = client_socket;
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &ev) == -1)
+                {
+                    printf("epoll_ctl: client_socket");
+                    close(client_socket);
+                    continue;
+                }
+
+                printf("Accepted new connection on client_socket %d\n", client_socket);
+            }
+            else if (events[i].events & EPOLLIN)
+            {
+                // Read data from the client socket
+                int client_socket = events[i].data.fd;
+                add_task_to_pool(pool, client_socket); // Add the client to the task pool for processing
+            }
         }
     }
 
@@ -396,6 +441,7 @@ void start_server()
     printf("Server is shutting down...\n");
     thread_pool_shutdown(pool);
     close(server_socket);
+    close(epoll_fd);
 }
 
 int main()
