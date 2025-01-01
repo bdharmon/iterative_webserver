@@ -19,6 +19,18 @@
 #define TASK_QUEUE_SIZE 10  // Maximum number of tasks in the queue
 #define EPOLL_MAX_EVENTS 10 // Max events to handle at once
 
+#define TABLE_SIZE 4
+
+// Define the function signatures for handlers
+typedef void (*HandlerFunction)(int client_socket);
+
+// Define a structure for the route-entry in the hash table
+typedef struct RouteEntry
+{
+    char *path;
+    HandlerFunction handler;
+} RouteEntry;
+
 int epoll_fd; // epoll instance descriptor
 struct epoll_event ev;
 struct epoll_event events[EPOLL_MAX_EVENTS];
@@ -55,6 +67,171 @@ void *worker_thread(void *arg);
 void add_task_to_pool(thread_pool_t *pool, int client_socket);
 void thread_pool_shutdown(thread_pool_t *pool);
 thread_pool_t *thread_pool_init(int pool_size, int queue_size);
+
+// Define the node structure for the linked list (for separate chaining)
+typedef struct Node
+{
+    char *key;
+    RouteEntry *value;
+    struct Node *next;
+} Node;
+
+// Define the hash table structure
+typedef struct HashTable
+{
+    Node *table[TABLE_SIZE];
+} HashTable;
+
+// Hash table for storing the routes
+HashTable *route_table;
+
+// A simple hashing function based on DJB2 hash algorithm
+// This is a good choice because it's fast and has a good distribution of hash values
+unsigned int hash(char *key)
+{
+    unsigned int hash = 5381;
+    int c;
+
+    while ((c = *key++))
+    {
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+    }
+    return hash % TABLE_SIZE;
+}
+
+// Create a new hash table
+HashTable *create_hash_table()
+{
+    HashTable *ht = (HashTable *)malloc(sizeof(HashTable));
+    for (int i = 0; i < TABLE_SIZE; i++)
+    {
+        ht->table[i] = NULL; // Initialize all buckets as NULL
+    }
+    return ht;
+}
+
+// Insert a key-value pair into the hash table
+void insert(HashTable *ht, char *key, HandlerFunction handler_function)
+{
+    unsigned int index = hash(key);
+    Node *new_node = (Node *)malloc(sizeof(Node));
+    RouteEntry *route = (RouteEntry *)malloc(sizeof(RouteEntry));
+    route->path = strdup(key);
+    route->handler = handler_function;
+    new_node->key = strdup(key); // Duplicate the key string
+    new_node->value = route;
+    new_node->next = NULL;
+
+    // Insert at the beginning of the linked list at the computed index
+    if (ht->table[index] == NULL)
+    {
+        ht->table[index] = new_node;
+    }
+    else
+    {
+        new_node->next = ht->table[index];
+        ht->table[index] = new_node;
+    }
+}
+
+// Search for a value by key in the hash table
+RouteEntry* search(HashTable *ht, char *key)
+{
+    unsigned int index = hash(key);
+    Node *current = ht->table[index];
+
+    while (current != NULL)
+    {
+        if (strcmp(current->key, key) == 0)
+        {
+            return current->value; // Key found, return its value (i.e. - RouteEntry struct)
+        }
+        current = current->next; // Move to the next node in the chain
+    }
+    return NULL; // Key not found
+}
+
+// Delete a key-value pair from the hash table
+void delete(HashTable *ht, char *key)
+{
+    unsigned int index = hash(key);
+    Node *current = ht->table[index];
+    Node *prev = NULL;
+
+    while (current != NULL)
+    {
+        if (strcmp(current->key, key) == 0)
+        {
+            if (prev == NULL)
+            {
+                // If the node to be deleted is the first node in the chain
+                ht->table[index] = current->next;
+            }
+            else
+            {
+                prev->next = current->next;
+            }
+            
+            free(current->value->path);
+            free(current->value);
+            free(current->key); // Free the duplicated key
+            free(current);      // Free the node
+            return;
+        }
+        prev = current;
+        current = current->next;
+    }
+}
+
+// Print the hash table for debugging purposes
+void print_hash_table(HashTable *ht)
+{
+    for (int i = 0; i < TABLE_SIZE; i++)
+    {
+        if (ht->table[i] != NULL)
+        {
+            Node *current = ht->table[i];
+            printf("Index %d: ", i);
+            while (current != NULL)
+            {
+                printf("(%s) -> ", current->key);
+                current = current->next;
+            }
+            printf("NULL\n");
+        }
+    }
+}
+
+void free_route(RouteEntry* route) {
+    if (route) {
+        free(route->path);
+        free(route->handler);
+        free(route);
+    }
+}
+
+// Free the entire hash table
+void free_hash_table(HashTable *ht)
+{
+    for (int i = 0; i < TABLE_SIZE; i++)
+    {
+        Node *current = ht->table[i];
+        while (current != NULL)
+        {
+            Node *temp = current;
+            current = current->next;
+
+            if (temp->value != NULL)
+            {
+                free_route(temp->value);
+            }
+
+            free(temp->key);
+            free(temp->value);
+        }
+    }
+    free(ht);
+}
 
 void *worker_thread(void *arg)
 {
@@ -238,22 +415,11 @@ void handle_client_request(int client_socket)
     printf("version: %s\n", version);
     printf("\t----- Request End -----\n\n");
 
-    // Handle different endpoints
-    if (strcmp(path, "/") == 0)
+    // Find the corresponding handler for the path
+    RouteEntry* route = search(route_table, path);
+    if (route)
     {
-        handle_home(client_socket);
-    }
-    else if (strcmp(path, "/about") == 0)
-    {
-        handle_about(client_socket);
-    }
-    else if (strcmp(path, "/contact") == 0)
-    {
-        handle_contact(client_socket);
-    }
-    else if (strcmp(path, "/delay") == 0)
-    {
-        handle_delay(client_socket);
+        route->handler(client_socket);
     }
     else
     {
@@ -317,6 +483,12 @@ void handle_not_found(int client_socket)
 
 void start_server()
 {
+    route_table = create_hash_table(); // Initialize the route table
+    insert(route_table, "/", handle_home);
+    insert(route_table, "/about", handle_about);
+    insert(route_table, "/contact", handle_contact);
+    insert(route_table, "/delay", handle_delay);
+
     int server_socket;
     struct sockaddr_in server_addr;
     struct sockaddr_in client_addr;
@@ -426,7 +598,7 @@ void start_server()
                     continue;
                 }
 
-                printf("Accepted new connection on client_socket %d\n", client_socket);
+                // printf("Accepted new connection on client_socket %d\n", client_socket);
             }
             else if (events[i].events & EPOLLIN)
             {
@@ -437,8 +609,9 @@ void start_server()
         }
     }
 
-    // Once the server is shutting down, close the server socket.
+    // Once the server is shutting down, cleanup.
     printf("Server is shutting down...\n");
+    free_hash_table(route_table);
     thread_pool_shutdown(pool);
     close(server_socket);
     close(epoll_fd);
