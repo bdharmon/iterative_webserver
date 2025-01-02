@@ -20,9 +20,6 @@ RouteTable *route_table = NULL;
 
 void start_server()
 {
-    memset(&ev, 0, sizeof(ev));
-    memset(&events, 0, sizeof(events));
-
     route_table = create_route_table(); // Initialize the route table
     insert_route(route_table, "/", handle_home);
     insert_route(route_table, "/about", handle_about);
@@ -92,6 +89,9 @@ void start_server()
         printf("epoll_create1");
         exit(EXIT_FAILURE);
     }
+
+    memset(&ev, 0, sizeof(ev));
+    memset(&events, 0, sizeof(events));
 
     // Add the server socket to the epoll instance
     ev.events = EPOLLIN; // Monitor for input events (new connections)
